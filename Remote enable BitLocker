@@ -1,0 +1,104 @@
+# This will enable BitLocker for computers (via CSV import) then log errors, if unable to be enrolled.
+
+# Define CSV file paths
+$CsvFilePath = "PATH\TO\CSV\computers.csv"
+$ResultsCsv = "PATH\TO\RESULTS\BitLockerResults.csv"
+
+# Read the CSV file
+$Computers = Import-Csv -Path $CsvFilePath
+
+# Encryption settings
+$EncryptionMethod = "XtsAes256"  # Strong encryption method
+$RecoveryPasswordProtector = $true  # Enable recovery password
+$SaveRecoveryKeyToAD = $true  # Save recovery key to Active Directory
+
+# Initialize results list
+$Results = @()
+
+# Loop through each computer
+foreach ($Computer in $Computers) {
+    $ComputerName = $Computer.ComputerName
+    Write-Output "Processing $ComputerName..."
+    
+    try {
+        # Invoke command on remote computer
+        $Result = Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+            param ($EncryptionMethod, $RecoveryPasswordProtector, $SaveRecoveryKeyToAD)
+
+            $Errors = @()
+            try {
+                # Ensure BitLocker is installed
+                $OS = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
+                if ($OS -match "Windows Server") {
+                    if (!(Get-WindowsFeature -Name BitLocker).Installed) {
+                        Install-WindowsFeature -Name BitLocker -IncludeManagementTools -Confirm:$false
+                    }
+                } else {
+                    if (!(Get-WindowsOptionalFeature -Online -FeatureName BitLocker).State -eq "Enabled") {
+                        Enable-WindowsOptionalFeature -Online -FeatureName BitLocker -NoRestart
+                    }
+                }
+
+                # Check BitLocker status
+                $Status = Get-BitLockerVolume -MountPoint "C:"
+                if ($Status.ProtectionStatus -eq "On") {
+                    return @{ Status = "Success"; ErrorMessage = "BitLocker already enabled" }
+                }
+
+                # Add a recovery password protector
+                if ($RecoveryPasswordProtector) {
+                    try {
+                        $RecoveryPassword = Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector
+                    } catch {
+                        $Errors += "Error adding Recovery Password Protector: $_"
+                    }
+                }
+
+                # Encrypt the drive with SkipHardwareTest
+                try {
+                    Enable-BitLocker -MountPoint "C:" -EncryptionMethod $EncryptionMethod -UsedSpaceOnly -TpmProtector -SkipHardwareTest
+                } catch {
+                    $Errors += "Error enabling BitLocker: $_"
+                }
+                
+                # Retrieve the KeyProtectorId after encryption
+                $BitLockerVolume = Get-BitLockerVolume -MountPoint "C:"
+                $KeyProtector = $BitLockerVolume.KeyProtector | Where-Object { $_.KeyProtectorType -eq "RecoveryPassword" }
+                
+                if ($KeyProtector -and $KeyProtector.KeyProtectorId) {
+                    $KeyProtectorId = $KeyProtector.KeyProtectorId
+                    
+                    # Save recovery key to AD if required
+                    if ($SaveRecoveryKeyToAD) {
+                        try {
+                            Backup-BitLockerKeyProtector -MountPoint "C:" -KeyProtectorId $KeyProtectorId
+                        } catch {
+                            $Errors += "Error backing up BitLocker key to AD: $_"
+                        }
+                    }
+                } else {
+                    $Errors += "Backup to AD failed: KeyProtectorId is missing."
+                }
+                
+                if ($Errors.Count -gt 0) {
+                    return @{ Status = "Failed"; ErrorMessage = ($Errors -join "; ") }
+                }
+                return @{ Status = "Success"; ErrorMessage = "" }
+
+            } catch {
+                return @{ Status = "Failed"; ErrorMessage = $_.ToString() }
+            }
+        } -ArgumentList $EncryptionMethod, $RecoveryPasswordProtector, $SaveRecoveryKeyToAD
+        
+        # Store results
+        $Results += [PSCustomObject]@{ComputerName=$ComputerName; Status=$Result.Status; ErrorMessage=$Result.ErrorMessage}
+    } catch {
+        # Capture invocation errors
+        $Results += [PSCustomObject]@{ComputerName=$ComputerName; Status="Failed"; ErrorMessage=$_.ToString()}
+        Write-Error "Failed to configure BitLocker on $ComputerName $_"
+    }
+}
+
+# Export results to CSV
+$Results | Export-Csv -Path $ResultsCsv -NoTypeInformation
+Write-Output "BitLocker operation results exported to $ResultsCsv"
